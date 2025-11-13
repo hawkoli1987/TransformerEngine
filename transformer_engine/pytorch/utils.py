@@ -71,9 +71,11 @@ def get_device_compute_capability() -> Tuple[int, int]:
 def attention_mask_func(
     attention_scores: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
-    """Get attention mask"""
-    attention_scores.masked_fill_(attention_mask, -10000.0)
-    return attention_scores
+    """Apply attention mask or additive bias to attention scores."""
+    if attention_mask.dtype == torch.bool:
+        attention_scores.masked_fill_(attention_mask, -10000.0)
+        return attention_scores
+    return attention_scores + attention_mask
 
 
 def get_default_init_method() -> Callable:

@@ -317,25 +317,57 @@ class UnfusedDotProductAttention(torch.nn.Module):
             key_layer.shape[0],
         )
 
-        if "padding" in attn_mask_type and attention_mask is None:
-            attention_mask = dpa_utils.get_padding_mask(
-                batch_size,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                max_seqlen_q,
-                max_seqlen_kv,
-                self.attention_type,
+        mask_is_additive = dpa_utils.is_additive_attention_mask(attention_mask)
+        additive_mask = None
+        if mask_is_additive:
+            if isinstance(attention_mask, tuple):
+                raise ValueError("Additive attention masks do not support tuple inputs.")
+            additive_mask = attention_mask
+            actual_seqlens_q = None
+            actual_seqlens_kv = None
+        else:
+            if "padding" in attn_mask_type and attention_mask is None:
+                attention_mask = dpa_utils.get_padding_mask(
+                    batch_size,
+                    cu_seqlens_q,
+                    cu_seqlens_kv,
+                    max_seqlen_q,
+                    max_seqlen_kv,
+                    self.attention_type,
+                )
+            attn_mask_type, attention_mask, actual_seqlens_q, actual_seqlens_kv = (
+                dpa_utils.get_full_mask(
+                    max_seqlen_q,
+                    max_seqlen_kv,
+                    attn_mask_type=attn_mask_type,
+                    attention_mask=attention_mask,
+                    window_size=window_size,
+                    attention_type=self.attention_type,
+                )
             )
-        attn_mask_type, attention_mask, actual_seqlens_q, actual_seqlens_kv = (
-            dpa_utils.get_full_mask(
-                max_seqlen_q,
-                max_seqlen_kv,
-                attn_mask_type=attn_mask_type,
-                attention_mask=attention_mask,
-                window_size=window_size,
-                attention_type=self.attention_type,
-            )
-        )
+
+        if additive_mask is not None:
+            additive_mask = additive_mask.to(device=query_layer.device)
+            if additive_mask.dim() == 2:
+                additive_mask = additive_mask.unsqueeze(0).unsqueeze(0)
+            elif additive_mask.dim() == 3:
+                additive_mask = additive_mask.unsqueeze(1)
+            elif additive_mask.dim() == 4:
+                num_heads = query_layer.shape[2]
+                if additive_mask.size(1) not in (1, num_heads):
+                    raise ValueError(
+                        "Additive attention mask must broadcast across attention heads."
+                    )
+            else:
+                raise ValueError("Unsupported additive attention mask rank.")
+
+            additive_mask = additive_mask.to(query_layer.dtype)
+            attention_mask = torch.isneginf(additive_mask)
+            if not attention_mask.any():
+                threshold = torch.tensor(-1e4, dtype=additive_mask.dtype, device=additive_mask.device)
+                attention_mask = additive_mask <= threshold
+            attention_mask = attention_mask.to(torch.bool)
+            attn_mask_type = "arbitrary"
 
         batch_size, seqlen = query_layer.shape[1], query_layer.shape[0]
         apply_qk_layer_scaling = self.apply_qk_layer_scaling and key_layer.dtype == torch.float16
@@ -449,6 +481,9 @@ class UnfusedDotProductAttention(torch.nn.Module):
             matmul_result = (matmul_result.view(*output_size) + core_attention_bias).to(
                 dtype=query_layer.dtype
             )
+
+        if additive_mask is not None:
+            matmul_result = matmul_result + additive_mask
 
         if fp8:
             # quantize and dequantize dP to emulate FP8
