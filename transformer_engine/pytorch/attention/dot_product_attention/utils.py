@@ -106,6 +106,21 @@ def maybe_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous() if tensor.stride(-1) != 1 else tensor
 
 
+def is_additive_attention_mask(
+    attention_mask: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]]
+) -> bool:
+    """Return True when attention_mask encodes additive values instead of booleans."""
+
+    def _is_additive(mask: Optional[torch.Tensor]) -> bool:
+        return isinstance(mask, torch.Tensor) and mask.dtype not in (torch.bool, torch.uint8)
+
+    if attention_mask is None:
+        return False
+    if isinstance(attention_mask, tuple):
+        return any(_is_additive(mask) for mask in attention_mask if mask is not None)
+    return _is_additive(attention_mask)
+
+
 class FlashAttentionUtils:
     """
     Manage Flash Attention versioning information
@@ -233,6 +248,8 @@ class AttentionParams:
         Whether to output max_logit.
     cuda_graph: bool, default = `False`
         Whether support for cuda graph capture is needed or not.
+    has_sparse_mask: bool, default = `False`
+        Indicates that the provided attention mask encodes additive sparsity (e.g. DeepSeek DSA).
     """
 
     qkv_type: Union[torch.Tensor, Float8Tensor] = torch.Tensor
@@ -263,6 +280,7 @@ class AttentionParams:
     softmax_type: str = "vanilla"
     return_max_logit: bool = False
     cuda_graph: bool = False
+    has_sparse_mask: bool = False
 
     def __eq__(self, other):
         """
@@ -338,6 +356,7 @@ def get_attention_backend(
     softmax_type = attention_params.softmax_type
     return_max_logit = attention_params.return_max_logit
     cuda_graph = attention_params.cuda_graph
+    has_sparse_mask = attention_params.has_sparse_mask
 
     # Run config
     logger = logging.getLogger("DotProductAttention")
@@ -414,6 +433,20 @@ def get_attention_backend(
         logger.debug("Disabling FusedAttention due to NVTE_FUSED_ATTN=0")
     if not use_unfused_attention:
         logger.debug("Disabling UnfusedDotProductAttention due to NVTE_UNFUSED_ATTN=0")
+
+    if has_sparse_mask:
+        if use_flash_attention_2 and FlashAttentionUtils.is_installed:
+            logger.debug("Disabling FlashAttention 2 for additive attention masks.")
+        if use_flash_attention_3 and FlashAttentionUtils.v3_is_installed:
+            logger.debug("Disabling FlashAttention 3 for additive attention masks.")
+        if use_flash_attention:
+            logger.debug("Disabling FlashAttention for additive attention masks.")
+        if use_fused_attention:
+            logger.debug("Disabling FusedAttention for additive attention masks.")
+        use_flash_attention = False
+        use_flash_attention_2 = False
+        use_flash_attention_3 = False
+        use_fused_attention = False
 
     # Filter: Compute capability
     if device_compute_capability < (8, 0):

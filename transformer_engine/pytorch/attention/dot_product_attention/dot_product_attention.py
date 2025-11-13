@@ -1052,6 +1052,8 @@ class DotProductAttention(TransformerEngineBaseModule):
                 attn_mask_type in AttnMaskTypes
             ), f"Attention mask type {attn_mask_type} is not supported!"
 
+            has_sparse_mask = dpa_utils.is_additive_attention_mask(attention_mask)
+
             # checks for sliding window
             if window_size is None:
                 window_size = self.window_size
@@ -1315,6 +1317,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                 softmax_type=self.softmax_type,
                 return_max_logit=self.return_max_logit,
                 cuda_graph=is_graph_capturing(),
+                has_sparse_mask=has_sparse_mask,
             )
             global _attention_backends
             if is_in_onnx_export_mode():

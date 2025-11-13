@@ -2,6 +2,7 @@
 #
 # See LICENSE for license information.
 import logging
+import math
 import os
 import sys
 import pathlib
@@ -2736,3 +2737,54 @@ class Custom_MHA_FP8(TransformerEngineBaseModule):
                 self.quantizers,
             )
         return out
+
+
+@pytest.mark.cuda
+def test_dot_product_attention_additive_mask():
+    """Ensure additive (float) attention masks produce sparse outputs."""
+    torch.manual_seed(123)
+    device = "cuda"
+    dtype = torch.float32
+
+    batch = 2
+    seqlen = 4
+    num_heads = 3
+    kv_channels = 8
+
+    dpa = DotProductAttention(
+        num_attention_heads=num_heads,
+        kv_channels=kv_channels,
+        attention_dropout=0.0,
+        attn_mask_type="arbitrary",
+    ).to(device=device)
+
+    query = torch.randn(seqlen, batch, num_heads, kv_channels, device=device, dtype=dtype, requires_grad=True)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+
+    mask = torch.full((batch, 1, seqlen, seqlen), float("-inf"), device=device, dtype=dtype)
+    mask[:, :, torch.arange(seqlen), torch.arange(seqlen)] = 0.0
+    mask[:, :, :, 0] = 0.0
+
+    output = dpa(
+        query,
+        key,
+        value,
+        attention_mask=mask,
+        attn_mask_type="arbitrary",
+        is_first_microbatch=True,
+    )
+
+    scale = dpa.softmax_scale if dpa.softmax_scale is not None else 1.0 / math.sqrt(kv_channels)
+    q_ref = query.permute(1, 2, 0, 3)  # [b, h, s, d]
+    k_ref = key.permute(1, 2, 0, 3)
+    v_ref = value.permute(1, 2, 0, 3)
+    scores = torch.matmul(q_ref, k_ref.transpose(-2, -1)) * scale
+    scores = scores + mask
+    probs = torch.softmax(scores, dim=-1)
+    expected = torch.matmul(probs, v_ref)
+    expected = expected.permute(2, 0, 1, 3).contiguous().view(seqlen, batch, -1)
+
+    assert torch.allclose(output, expected, atol=1e-5, rtol=1e-5)
+
+    output.sum().backward()
